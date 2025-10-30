@@ -29,7 +29,9 @@ pub use layers::{AuthLayer, AuthService};
 mod hyper_transport;
 #[cfg(all(not(target_family = "wasm"), feature = "hyper"))]
 #[doc(inline)]
-pub use hyper_transport::{HyperClient, HyperResponse, HyperResponseFut, HyperTransport};
+pub use hyper_transport::{
+    HyperClient, HyperClientLayered, HyperResponse, HyperResponseFut, HyperTransport,
+};
 
 use alloy_transport::utils::guess_local_url;
 use core::str::FromStr;

@@ -11,7 +11,7 @@ use hyper::{
 };
 use hyper_util::client::legacy::Error;
 use std::{future::Future, marker::PhantomData, pin::Pin, task};
-use tower::Service;
+use tower::{Layer, Service};
 use tracing::{debug, debug_span, trace, Instrument};
 
 #[cfg(feature = "hyper-tls")]
@@ -65,6 +65,27 @@ impl HyperClient {
             hyper_util::client::legacy::Client::builder(executor).build_http::<Full<Bytes>>();
         Self { service, _pd: PhantomData }
     }
+
+    /// Create a layer builder for composing tower middleware layers with the default hyper client.
+    ///
+    /// This allows you to easily add layers like [`AuthLayer`] without manually constructing
+    /// [`tower::ServiceBuilder`].
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// # use alloy_transport_http::{HyperClient, AuthLayer};
+    /// # use alloy_rpc_types_engine::JwtSecret;
+    /// let secret = JwtSecret::random();
+    /// let client = HyperClient::new()
+    ///     .layer(AuthLayer::new(secret))
+    ///     .fuse();
+    /// ```
+    ///
+    /// [`AuthLayer`]: crate::AuthLayer
+    pub const fn layer<L: Layer<Hyper>>(self, layer: L) -> HyperClientLayered<L> {
+        HyperClientLayered { inner_client: self, layer }
+    }
 }
 
 impl Default for HyperClient {
@@ -77,6 +98,45 @@ impl<B, S> HyperClient<B, S> {
     /// Create a new [HyperClient] with the given URL and service.
     pub const fn with_service(service: S) -> Self {
         Self { service, _pd: PhantomData }
+    }
+}
+
+/// A layered hyper client that allows composing tower middleware layers.
+///
+/// This type is created by calling [`HyperClient::layer`] and allows you to add
+/// additional layers before finalizing the client.
+#[derive(Clone, Debug)]
+pub struct HyperClientLayered<L> {
+    inner_client: HyperClient,
+    layer: L,
+}
+
+impl<L> HyperClientLayered<L>
+where
+    L: Layer<Hyper> + Clone,
+    L::Service: Service<Request<Full<Bytes>>, Response = Response<Incoming>>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    <L::Service as Service<Request<Full<Bytes>>>>::Future: Send,
+    <L::Service as Service<Request<Full<Bytes>>>>::Error: std::error::Error + Send + Sync + 'static,
+{
+    /// Finalize the layered client configuration and return a [`HyperClient`] ready to use.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// # use alloy_transport_http::{HyperClient, AuthLayer};
+    /// # use alloy_rpc_types_engine::JwtSecret;
+    /// let secret = JwtSecret::random();
+    /// let client = HyperClient::new()
+    ///     .layer(AuthLayer::new(secret))
+    ///     .fuse();
+    /// ```
+    pub fn fuse(self) -> HyperClient<Full<Bytes>, L::Service> {
+        let service = self.layer.layer(self.inner_client.service);
+        HyperClient::with_service(service)
     }
 }
 
