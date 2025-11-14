@@ -17,6 +17,7 @@ pub use alloy_consensus_any::AnyReceiptEnvelope;
 pub use alloy_eips::{
     eip2930::{AccessList, AccessListItem, AccessListResult},
     eip7702::{Authorization, SignedAuthorization},
+    eip7594::BlobTransactionSidecarVariant,
 };
 
 mod error;

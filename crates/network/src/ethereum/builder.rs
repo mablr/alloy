@@ -216,7 +216,7 @@ mod tests {
             .with_max_fee_per_gas(0)
             .with_max_priority_fee_per_gas(0)
             .with_to(Address::ZERO)
-            .with_blob_sidecar(BlobTransactionSidecar::default())
+            .with_blob_sidecar(BlobTransactionSidecar::default().into())
             .with_max_fee_per_blob_gas(0);
 
         let tx = request.clone().build_unsigned().unwrap();
@@ -226,6 +226,37 @@ mod tests {
         let tx = request.with_gas_price(0).build_unsigned().unwrap();
 
         assert!(matches!(tx, TypedTransaction::Eip4844(_)));
+    }
+
+    #[test]
+    fn test_7594_when_sidecar() {
+        use alloy_eips::eip7594::BlobTransactionSidecarEip7594;
+
+        let request = TransactionRequest::default()
+            .with_nonce(1)
+            .with_gas_limit(0)
+            .with_max_fee_per_gas(0)
+            .with_max_priority_fee_per_gas(0)
+            .with_to(Address::ZERO)
+            .with_blob_sidecar(BlobTransactionSidecarEip7594::default().into())
+            .with_max_fee_per_blob_gas(0);
+
+        // EIP-7594 sidecars must use build_7594_with_sidecar
+        let tx_with_sidecar = request.clone().build_7594_with_sidecar().unwrap();
+        assert!(matches!(tx_with_sidecar.sidecar, BlobTransactionSidecarEip7594 { .. }));
+
+        let request2 = TransactionRequest::default()
+            .with_nonce(1)
+            .with_gas_limit(0)
+            .with_max_fee_per_gas(0)
+            .with_max_priority_fee_per_gas(0)
+            .with_to(Address::ZERO)
+            .with_blob_sidecar(BlobTransactionSidecarEip7594::default().into())
+            .with_max_fee_per_blob_gas(0)
+            .with_gas_price(0);
+
+        let tx_with_sidecar2 = request2.build_7594_with_sidecar().unwrap();
+        assert!(matches!(tx_with_sidecar2.sidecar, BlobTransactionSidecarEip7594 { .. }));
     }
 
     #[test]
@@ -286,7 +317,7 @@ mod tests {
     #[test]
     fn test_fail_when_sidecar_and_access_list() {
         let request = TransactionRequest::default()
-            .with_blob_sidecar(BlobTransactionSidecar::default())
+            .with_blob_sidecar(BlobTransactionSidecar::default().into())
             .with_access_list(AccessList::default());
 
         let error = request.build_unsigned().unwrap_err();
@@ -354,8 +385,8 @@ mod tests {
 
     #[test]
     fn test_invalid_4844_fields() {
-        let request =
-            TransactionRequest::default().with_blob_sidecar(BlobTransactionSidecar::default());
+        let request = TransactionRequest::default()
+            .with_blob_sidecar(BlobTransactionSidecar::default().into());
 
         let error = request.build_unsigned().unwrap_err();
 
@@ -372,6 +403,25 @@ mod tests {
         assert!(errors.contains(&"max_priority_fee_per_gas"));
         assert!(errors.contains(&"max_fee_per_gas"));
         assert!(errors.contains(&"max_fee_per_blob_gas"));
+    }
+
+    #[test]
+    fn test_invalid_7594_fields() {
+        use alloy_eips::eip7594::BlobTransactionSidecarEip7594;
+
+        let request = TransactionRequest::default()
+            .with_blob_sidecar(BlobTransactionSidecarEip7594::default().into());
+
+        // build_unsigned uses build_4844_with_sidecar which rejects 7594 sidecars
+        let error = request.clone().build_unsigned().unwrap_err();
+        let TransactionBuilderError::InvalidTransactionRequest(tx_type, _errors) = error.error else {
+            panic!("wrong variant")
+        };
+        assert_eq!(tx_type, TxType::Eip4844);
+
+        // build_7594_with_sidecar also fails because other required fields are missing
+        let error2 = request.build_7594_with_sidecar();
+        assert!(error2.is_err());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Alloy basic Transaction Request type.
 
-use crate::{transaction::AccessList, BlobTransactionSidecar, Transaction, TransactionTrait};
+use crate::{transaction::AccessList, BlobTransactionSidecarVariant, Transaction, TransactionTrait};
 use alloc::{
     string::{String, ToString},
     vec,
@@ -11,7 +11,7 @@ use alloy_consensus::{
     TxEip4844, TxEip4844Variant, TxEip4844WithSidecar, TxEip7702, TxEnvelope, TxLegacy, TxType,
     Typed2718, TypedTransaction,
 };
-use alloy_eips::eip7702::SignedAuthorization;
+use alloy_eips::{eip4844::BlobTransactionSidecar, eip7594::{BlobTransactionSidecarEip7594, CELLS_PER_EXT_BLOB}, eip7702::SignedAuthorization};
 use alloy_network_primitives::{TransactionBuilder4844, TransactionBuilder7702};
 use alloy_primitives::{Address, Bytes, ChainId, Signature, TxKind, B256, U256};
 use core::{hash::Hash, str::FromStr};
@@ -120,15 +120,15 @@ pub struct TransactionRequest {
     )]
     #[doc(alias = "tx_type")]
     pub transaction_type: Option<u8>,
-    /// Blob versioned hashes for EIP-4844 transactions.
+    /// Blob versioned hashes for EIP-4844/EIP-7594 transactions.
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
     pub blob_versioned_hashes: Option<Vec<B256>>,
-    /// Blob sidecar for EIP-4844 transactions.
+    /// Blob sidecar for EIP-4844/EIP-7594 transactions.
     #[cfg_attr(
         feature = "serde",
         serde(default, flatten, skip_serializing_if = "Option::is_none")
     )]
-    pub sidecar: Option<BlobTransactionSidecar>,
+    pub sidecar: Option<BlobTransactionSidecarVariant>,
     /// Authorization list for EIP-7702 transactions.
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
     pub authorization_list: Option<Vec<SignedAuthorization>>,
@@ -574,11 +574,52 @@ impl TransactionRequest {
     ///
     /// Returns an error if required fields are missing. Use `complete_4844` to check if the
     /// request can be built.
+    ///
+    /// Accepts both EIP-4844 and EIP-7594 sidecars. For EIP-7594 sidecars, see
+    /// [`build_7594_with_sidecar`](Self::build_7594_with_sidecar) for type-safe handling.
     pub fn build_4844_with_sidecar(mut self) -> Result<TxEip4844WithSidecar, ValueError<Self>> {
         self.populate_blob_hashes();
 
-        let Some(sidecar) = self.sidecar.take() else {
+        let Some(sidecar_variant) = self.sidecar.take() else {
             return Err(ValueError::new(self, "Missing 'sidecar' field for Eip4844 transaction."));
+        };
+
+        let sidecar = match sidecar_variant.into_eip4844() {
+            Some(sidecar) => sidecar,
+            None => {
+                return Err(ValueError::new(
+                    self,
+                    "The provided sidecar is not of EIP-4844 type. Use `build_7594_with_sidecar` for EIP-7594 sidecars.",
+                ))
+            }
+        };
+
+        Ok(TxEip4844WithSidecar { sidecar, tx: self.build_4844_without_sidecar()? })
+    }
+
+    /// Build an EIP-4844 transaction with an EIP-7594 sidecar.
+    ///
+    /// Returns an error if required fields are missing. Use `complete_7594` to check if the
+    /// request can be built.
+    ///
+    /// This method preserves the EIP-7594 sidecar format with cell proofs.
+    pub fn build_7594_with_sidecar(
+        mut self,
+    ) -> Result<TxEip4844WithSidecar<BlobTransactionSidecarEip7594>, ValueError<Self>> {
+        self.populate_blob_hashes();
+
+        let Some(sidecar_variant) = self.sidecar.take() else {
+            return Err(ValueError::new(self, "Missing 'sidecar' field for Eip7594 transaction."));
+        };
+
+        let sidecar = match sidecar_variant.into_eip7594() {
+            Some(sidecar) => sidecar,
+            None => {
+                return Err(ValueError::new(
+                    self,
+                    "The provided sidecar is not of EIP-7594 type.",
+                ))
+            }
         };
 
         Ok(TxEip4844WithSidecar { sidecar, tx: self.build_4844_without_sidecar()? })
@@ -893,11 +934,8 @@ impl TransactionRequest {
         }
     }
 
-    /// Check if all necessary keys are present to build a 4844 transaction,
-    /// returning a list of keys that are missing.
-    ///
-    /// **NOTE:** `sidecar` must be present, even if `blob_versioned_hashes` is set.
-    pub fn complete_4844(&self) -> Result<(), Vec<&'static str>> {
+    /// Helper to collect missing fields for blob transactions (4844 and 7594).
+    fn collect_blob_missing_fields(&self, check_fn: impl Fn(&BlobTransactionSidecarVariant) -> bool) -> Vec<&'static str> {
         let mut missing = self.check_reqd_fields();
         self.check_1559_fields(&mut missing);
 
@@ -905,14 +943,35 @@ impl TransactionRequest {
             missing.push("to");
         }
 
-        if self.sidecar.is_none() {
+        if !self.sidecar.as_ref().is_some_and(check_fn) {
             missing.push("sidecar");
         }
-
         if self.max_fee_per_blob_gas.is_none() {
             missing.push("max_fee_per_blob_gas");
         }
 
+        missing
+    }
+
+    /// Check if all necessary keys are present to build a 4844 transaction,
+    /// returning a list of keys that are missing.
+    ///
+    /// **NOTE:** `sidecar` must be present, even if `blob_versioned_hashes` is set.
+    pub fn complete_4844(&self) -> Result<(), Vec<&'static str>> {
+        let missing = self.collect_blob_missing_fields(|s| s.as_eip4844().is_some());
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(missing)
+        }
+    }
+
+    /// Check if all necessary keys are present to build a 7594 transaction,
+    /// returning a list of keys that are missing.
+    ///
+    /// **NOTE:** `sidecar` must be present, even if `blob_versioned_hashes` is set.
+    pub fn complete_7594(&self) -> Result<(), Vec<&'static str>> {
+        let missing = self.collect_blob_missing_fields(|s| s.as_eip7594().is_some());
         if missing.is_empty() {
             Ok(())
         } else {
@@ -1066,11 +1125,11 @@ impl TransactionBuilder4844 for TransactionRequest {
         self.max_fee_per_blob_gas = Some(max_fee_per_blob_gas)
     }
 
-    fn blob_sidecar(&self) -> Option<&BlobTransactionSidecar> {
+    fn blob_sidecar(&self) -> Option<&BlobTransactionSidecarVariant> {
         self.sidecar.as_ref()
     }
 
-    fn set_blob_sidecar(&mut self, sidecar: BlobTransactionSidecar) {
+    fn set_blob_sidecar(&mut self, sidecar: BlobTransactionSidecarVariant) {
         self.sidecar = Some(sidecar);
         self.populate_blob_hashes();
     }
@@ -1214,6 +1273,15 @@ impl From<TxEip4844> for TransactionRequest {
 
 impl From<TxEip4844WithSidecar> for TransactionRequest {
     fn from(tx: TxEip4844WithSidecar) -> Self {
+        let TxEip4844WithSidecar { tx, sidecar } = tx;
+        let mut tx: Self = tx.into();
+        tx.sidecar = Some(sidecar.into());
+        tx
+    }
+}
+
+impl From<TxEip4844WithSidecar<BlobTransactionSidecarVariant>> for TransactionRequest {
+    fn from(tx: TxEip4844WithSidecar<BlobTransactionSidecarVariant>) -> Self {
         let TxEip4844WithSidecar { tx, sidecar } = tx;
         let mut tx: Self = tx.into();
         tx.sidecar = Some(sidecar);
@@ -1371,8 +1439,7 @@ impl From<TxEnvelope> for TransactionRequest {
 pub(super) mod serde_bincode_compat {
     use crate::TransactionInput;
     use alloc::{borrow::Cow, vec::Vec};
-    use alloy_consensus::BlobTransactionSidecar;
-    use alloy_eips::eip2930::AccessList;
+    use alloy_eips::{eip2930::AccessList, eip7594::BlobTransactionSidecarVariant};
     use alloy_primitives::{Address, Bytes, ChainId, TxKind, B256, U256};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use serde_with::{DeserializeAs, SerializeAs};
@@ -1425,7 +1492,7 @@ pub(super) mod serde_bincode_compat {
         /// Blob versioned hashes for EIP-4844 transactions.
         pub blob_versioned_hashes: Option<Cow<'a, Vec<B256>>>,
         /// Blob sidecar for EIP-4844 transactions.
-        pub sidecar: Option<Cow<'a, BlobTransactionSidecar>>,
+        pub sidecar: Option<Cow<'a, BlobTransactionSidecarVariant>>,
         /// Authorization list for EIP-7702 transactions.
         pub authorization_list:
             Option<Vec<alloy_eips::eip7702::serde_bincode_compat::SignedAuthorization<'a>>>,
@@ -1480,7 +1547,9 @@ pub(super) mod serde_bincode_compat {
                 blob_versioned_hashes: value
                     .blob_versioned_hashes
                     .map(|hashes| hashes.into_owned()),
-                sidecar: value.sidecar.map(|sidecar| sidecar.into_owned()),
+                sidecar: value
+                    .sidecar
+                    .map(|sidecar: Cow<'a, BlobTransactionSidecarVariant>| sidecar.into_owned()),
                 authorization_list: value
                     .authorization_list
                     .map(|list| list.into_iter().map(Into::into).collect()),
@@ -1758,6 +1827,7 @@ pub struct TransactionInputError;
 mod tests {
     use super::*;
     use crate::Authorization;
+    use alloy_consensus::BlobTransactionSidecar;
     use alloy_primitives::b256;
     #[cfg(feature = "serde")]
     use alloy_serde::WithOtherFields;
@@ -2032,7 +2102,7 @@ mod tests {
                 gas: Some(123456),
                 max_fee_per_blob_gas: Some(13579),
                 blob_versioned_hashes: Some(vec![B256::repeat_byte(0xAB)]),
-                sidecar: Some(sidecar),
+                sidecar: Some(sidecar.into()),
                 ..Default::default()
             };
 
@@ -2053,7 +2123,7 @@ mod tests {
                 gas: Some(123456),
                 max_fee_per_blob_gas: Some(13579),
                 blob_versioned_hashes: Some(vec![B256::repeat_byte(0xAB)]),
-                sidecar: Some(sidecar.clone()),
+                sidecar: Some(sidecar.clone().into()),
                 ..Default::default()
             };
 
@@ -2070,7 +2140,86 @@ mod tests {
                 gas: Some(123456),
                 max_fee_per_blob_gas: Some(13579),
                 blob_versioned_hashes: Some(vec![B256::repeat_byte(0xAB)]),
-                sidecar: Some(sidecar),
+                sidecar: Some(sidecar.into()),
+                ..Default::default()
+            };
+
+            let maybe_eip4844_tx: Result<TypedTransaction, _> =
+                eip4844_request_incorrect_to.build_consensus_tx();
+            assert_matches!(maybe_eip4844_tx, Err(..));
+        }
+
+        // EIP-7594 with sidecar
+        {
+            use alloy_eips::{eip4844::Blob, eip7594::BlobTransactionSidecarEip7594};
+
+            // EIP-7594 sidecars require using build_7594_with_sidecar() explicitly
+            // build_consensus_tx() calls build_4844_with_sidecar() which only accepts EIP-4844 sidecars
+            let sidecar =
+                BlobTransactionSidecarEip7594::new(vec![Blob::repeat_byte(0xFA)], Vec::new(), Vec::new());
+            let eip7594_request = TransactionRequest {
+                to: Some(TxKind::Call(Address::repeat_byte(0xDE))),
+                max_fee_per_gas: Some(1234),
+                max_priority_fee_per_gas: Some(678),
+                nonce: Some(57),
+                gas: Some(123456),
+                max_fee_per_blob_gas: Some(13579),
+                blob_versioned_hashes: Some(vec![B256::repeat_byte(0xAB)]),
+                sidecar: Some(sidecar.clone().into()),
+                ..Default::default()
+            };
+
+            // This should fail since build_consensus_tx uses build_4844_with_sidecar
+            let maybe_eip7594_tx: Result<TypedTransaction, _> =
+                eip7594_request.build_consensus_tx();
+            assert_matches!(maybe_eip7594_tx, Err(..));
+
+            // Use build_7594_with_sidecar for EIP-7594 sidecars
+            let eip7594_request2 = TransactionRequest {
+                to: Some(TxKind::Call(Address::repeat_byte(0xDE))),
+                max_fee_per_gas: Some(1234),
+                max_priority_fee_per_gas: Some(678),
+                nonce: Some(57),
+                gas: Some(123456),
+                max_fee_per_blob_gas: Some(13579),
+                blob_versioned_hashes: Some(vec![B256::repeat_byte(0xAB)]),
+                sidecar: Some(sidecar.into()),
+                ..Default::default()
+            };
+
+            let maybe_eip7594_tx_direct = eip7594_request2.build_7594_with_sidecar();
+            assert_matches!(maybe_eip7594_tx_direct,
+                Ok(TxEip4844WithSidecar { sidecar, .. }) if sidecar == sidecar);
+
+            // with create to
+            let sidecar =
+                BlobTransactionSidecar::new(vec![Blob::repeat_byte(0xFA)], Vec::new(), Vec::new());
+            let eip4844_request = TransactionRequest {
+                to: Some(TxKind::Create),
+                max_fee_per_gas: Some(1234),
+                max_priority_fee_per_gas: Some(678),
+                nonce: Some(57),
+                gas: Some(123456),
+                max_fee_per_blob_gas: Some(13579),
+                blob_versioned_hashes: Some(vec![B256::repeat_byte(0xAB)]),
+                sidecar: Some(sidecar.clone().into()),
+                ..Default::default()
+            };
+
+            let maybe_eip4844_tx: Result<TypedTransaction, _> =
+                eip4844_request.build_consensus_tx();
+            assert_matches!(maybe_eip4844_tx, Err(..));
+
+            // Negative case
+            let eip4844_request_incorrect_to = TransactionRequest {
+                to: Some(TxKind::Create),
+                max_fee_per_gas: Some(1234),
+                max_priority_fee_per_gas: Some(678),
+                nonce: Some(57),
+                gas: Some(123456),
+                max_fee_per_blob_gas: Some(13579),
+                blob_versioned_hashes: Some(vec![B256::repeat_byte(0xAB)]),
+                sidecar: Some(sidecar.into()),
                 ..Default::default()
             };
 

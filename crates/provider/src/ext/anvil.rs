@@ -1240,7 +1240,7 @@ mod tests {
                     let tx = TransactionRequest::default()
                         .with_from(alice)
                         .with_to(bob)
-                        .with_blob_sidecar(sidecar.clone());
+                        .with_blob_sidecar(sidecar.clone().into());
 
                     let pending_tx = provider.send_transaction(tx).await.unwrap();
                     let _receipt = pending_tx.get_receipt().await.unwrap();
@@ -1280,7 +1280,7 @@ mod tests {
                     let tx = TransactionRequest::default()
                         .with_from(alice)
                         .with_to(bob)
-                        .with_blob_sidecar(sidecar.clone());
+                        .with_blob_sidecar(sidecar.clone().into());
 
                     let pending_tx = provider.send_transaction(tx).await.unwrap();
                     let receipt = pending_tx.get_receipt().await.unwrap();
