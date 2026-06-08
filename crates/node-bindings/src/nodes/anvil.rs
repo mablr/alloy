@@ -12,8 +12,10 @@ use std::{
     io::{BufRead, BufReader},
     net::SocketAddr,
     path::PathBuf,
-    process::{Child, Command},
+    process::{Child, Command, Stdio},
     str::FromStr,
+    sync::mpsc,
+    thread,
     time::{Duration, Instant},
 };
 use url::Url;
@@ -401,7 +403,7 @@ impl Anvil {
     /// Consumes the builder and spawns `anvil`. If spawning fails, returns an error.
     pub fn try_spawn(self) -> Result<AnvilInstance, NodeError> {
         let mut cmd = self.program.as_ref().map_or_else(|| Command::new("anvil"), Command::new);
-        cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::inherit());
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         // disable nightly warning
         cmd.env("FOUNDRY_DISABLE_NIGHTLY_WARNING", "")
@@ -444,12 +446,7 @@ impl Anvil {
 
         cmd.args(self.args);
 
-        let mut child = cmd.spawn().map_err(NodeError::SpawnError)?;
-
-        let stdout = child.stdout.take().ok_or(NodeError::NoStdout)?;
-
         let start = Instant::now();
-        let mut reader = BufReader::new(stdout);
         let timeout = self.timeout.map(Duration::from_millis).unwrap_or(NODE_STARTUP_TIMEOUT);
 
         let mut private_keys = Vec::new();
@@ -457,62 +454,118 @@ impl Anvil {
         let mut is_private_key = false;
         let mut chain_id = None;
         let mut wallet = None;
+
+        let mut child = cmd.spawn().map_err(NodeError::SpawnError)?;
+
+        if self.keep_stdout {
+            let stderr = child.stderr.take().ok_or(NodeError::NoStderr)?;
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || read_lines(stderr, tx));
+
+            let mut received_stderr = false;
+            while start + timeout > Instant::now() {
+                let remaining = (start + timeout).saturating_duration_since(Instant::now());
+                match rx.recv_timeout(remaining.min(Duration::from_secs(2))) {
+                    Ok(Ok(line)) => {
+                        received_stderr = true;
+                        if parse_anvil_line(
+                            &line,
+                            &mut port,
+                            &mut private_keys,
+                            &mut addresses,
+                            &mut is_private_key,
+                            &mut chain_id,
+                            &mut wallet,
+                        )? {
+                            return Ok(AnvilInstance {
+                                child,
+                                private_keys,
+                                addresses,
+                                wallet,
+                                ipc_path: self.ipc_path,
+                                host: self.host.unwrap_or_else(|| "localhost".to_string()),
+                                port,
+                                chain_id: self.chain_id.or(chain_id),
+                            });
+                        }
+                    }
+                    Ok(Err(err)) => return Err(NodeError::ReadLineError(err)),
+                    Err(mpsc::RecvTimeoutError::Timeout) if !received_stderr => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+
+            let stdout = child.stdout.as_mut().ok_or(NodeError::NoStdout)?;
+            let mut reader = BufReader::new(stdout);
+            loop {
+                if start + timeout <= Instant::now() {
+                    let _ = child.kill();
+                    return Err(NodeError::Timeout);
+                }
+
+                let mut line = String::new();
+                reader.read_line(&mut line).map_err(NodeError::ReadLineError)?;
+                if parse_anvil_line(
+                    &line,
+                    &mut port,
+                    &mut private_keys,
+                    &mut addresses,
+                    &mut is_private_key,
+                    &mut chain_id,
+                    &mut wallet,
+                )? {
+                    break;
+                }
+            }
+
+            return Ok(AnvilInstance {
+                child,
+                private_keys,
+                addresses,
+                wallet,
+                ipc_path: self.ipc_path,
+                host: self.host.unwrap_or_else(|| "localhost".to_string()),
+                port,
+                chain_id: self.chain_id.or(chain_id),
+            });
+        }
+
+        let stdout = child.stdout.take().ok_or(NodeError::NoStdout)?;
+        let stderr = child.stderr.take().ok_or(NodeError::NoStderr)?;
+        let (tx, rx) = mpsc::channel();
+        let stderr_tx = tx.clone();
+        thread::spawn(move || read_lines(stdout, tx));
+        thread::spawn(move || read_lines(stderr, stderr_tx));
+
         loop {
             if start + timeout <= Instant::now() {
                 let _ = child.kill();
                 return Err(NodeError::Timeout);
             }
 
-            let mut line = String::new();
-            reader.read_line(&mut line).map_err(NodeError::ReadLineError)?;
-            trace!(target: "alloy::node::anvil", line);
-            if let Some(addr) = line.strip_prefix("Listening on") {
-                // <Listening on 127.0.0.1:8545>
-                // parse the actual port
-                if let Ok(addr) = SocketAddr::from_str(addr.trim()) {
-                    port = addr.port();
+            let remaining = (start + timeout).saturating_duration_since(Instant::now());
+            match rx.recv_timeout(remaining) {
+                Ok(Ok(line)) => {
+                    if parse_anvil_line(
+                        &line,
+                        &mut port,
+                        &mut private_keys,
+                        &mut addresses,
+                        &mut is_private_key,
+                        &mut chain_id,
+                        &mut wallet,
+                    )? {
+                        break;
+                    }
                 }
-                break;
-            }
-
-            if line.starts_with("Private Keys") {
-                is_private_key = true;
-            }
-
-            if is_private_key && line.starts_with('(') {
-                let key_str =
-                    line.split("0x").last().ok_or(NodeError::ParsePrivateKeyError)?.trim();
-                let key_hex = hex::decode(key_str).map_err(NodeError::FromHexError)?;
-                let key = K256SecretKey::from_bytes((&key_hex[..]).into())
-                    .map_err(|_| NodeError::DeserializePrivateKeyError)?;
-                addresses.push(Address::from_public_key(SigningKey::from(&key).verifying_key()));
-                private_keys.push(key);
-            }
-
-            if let Some(start_chain_id) = line.find("Chain ID:") {
-                let rest = &line[start_chain_id + "Chain ID:".len()..];
-                if let Ok(chain) = rest.split_whitespace().next().unwrap_or("").parse::<u64>() {
-                    chain_id = Some(chain);
-                };
-            }
-
-            if !private_keys.is_empty() {
-                let mut private_keys = private_keys.iter().map(|key| {
-                    let mut signer = LocalSigner::from(key.clone());
-                    signer.set_chain_id(chain_id);
-                    signer
-                });
-                let mut w = EthereumWallet::new(private_keys.next().unwrap());
-                for pk in private_keys {
-                    w.register_signer(pk);
+                Ok(Err(err)) => return Err(NodeError::ReadLineError(err)),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let _ = child.kill();
+                    return Err(NodeError::Timeout);
                 }
-                wallet = Some(w);
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Err(NodeError::Timeout),
             }
-        }
-
-        if self.keep_stdout {
-            // re-attach the stdout handle if requested
-            child.stdout = Some(reader.into_inner());
         }
 
         Ok(AnvilInstance {
@@ -526,6 +579,71 @@ impl Anvil {
             chain_id: self.chain_id.or(chain_id),
         })
     }
+}
+
+fn read_lines<R: std::io::Read + Send + 'static>(
+    stream: R,
+    tx: mpsc::Sender<std::io::Result<String>>,
+) {
+    let reader = BufReader::new(stream);
+    for line in reader.lines() {
+        let _ = tx.send(line);
+    }
+}
+
+fn parse_anvil_line(
+    line: &str,
+    port: &mut u16,
+    private_keys: &mut Vec<K256SecretKey>,
+    addresses: &mut Vec<Address>,
+    is_private_key: &mut bool,
+    chain_id: &mut Option<ChainId>,
+    wallet: &mut Option<EthereumWallet>,
+) -> Result<bool, NodeError> {
+    trace!(target: "alloy::node::anvil", line);
+    if let Some(addr) = line.strip_prefix("Listening on") {
+        // <Listening on 127.0.0.1:8545>
+        // parse the actual port
+        if let Ok(addr) = SocketAddr::from_str(addr.trim()) {
+            *port = addr.port();
+        }
+        return Ok(true);
+    }
+
+    if line.starts_with("Private Keys") {
+        *is_private_key = true;
+    }
+
+    if *is_private_key && line.starts_with('(') {
+        let key_str = line.split("0x").last().ok_or(NodeError::ParsePrivateKeyError)?.trim();
+        let key_hex = hex::decode(key_str).map_err(NodeError::FromHexError)?;
+        let key = K256SecretKey::from_bytes((&key_hex[..]).into())
+            .map_err(|_| NodeError::DeserializePrivateKeyError)?;
+        addresses.push(Address::from_public_key(SigningKey::from(&key).verifying_key()));
+        private_keys.push(key);
+    }
+
+    if let Some(start_chain_id) = line.find("Chain ID:") {
+        let rest = &line[start_chain_id + "Chain ID:".len()..];
+        if let Ok(chain) = rest.split_whitespace().next().unwrap_or("").parse::<u64>() {
+            *chain_id = Some(chain);
+        };
+    }
+
+    if !private_keys.is_empty() {
+        let mut private_keys = private_keys.iter().map(|key| {
+            let mut signer = LocalSigner::from(key.clone());
+            signer.set_chain_id(*chain_id);
+            signer
+        });
+        let mut w = EthereumWallet::new(private_keys.next().unwrap());
+        for pk in private_keys {
+            w.register_signer(pk);
+        }
+        *wallet = Some(w);
+    }
+
+    Ok(false)
 }
 
 #[cfg(test)]
